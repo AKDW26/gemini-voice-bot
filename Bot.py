@@ -135,7 +135,9 @@ if "messages" not in st.session_state:
 
 # --- Voice Input Component (STT) ---
 
-audio_result = mic_recorder(
+# Storing mic_recorder output in a fixed session state key to track changes
+# This helps Streamlit detect a change from the component better than a local variable.
+st.session_state.audio_result = mic_recorder(
     start_prompt="🎙️ Start Speaking", 
     stop_prompt="🛑 Stop Recording", 
     key='mic_recorder',
@@ -144,9 +146,9 @@ audio_result = mic_recorder(
 )
 
 # --- Voice Input Debug ---
-# This section helps diagnose the transcription issue for the user.
 st.markdown("---")
 with st.expander("🎤 Voice Input Debug: What the bot heard"):
+    audio_result = st.session_state.audio_result
     transcribed_text = audio_result.get('text', 'No text transcribed yet.') if audio_result else 'No audio recorded yet.'
     
     # Check if the result dictionary is present, but the text is empty
@@ -158,12 +160,12 @@ st.markdown("---")
 # End Voice Input Debug
 
 # Handle the voice input if transcription text is available
-if audio_result and 'text' in audio_result:
-    prompt = audio_result['text']
+# Note: We use the session state key directly here
+if st.session_state.audio_result and 'text' in st.session_state.audio_result:
+    prompt = st.session_state.audio_result['text']
     
     # Check 1: Did the transcription fail (resulted in empty string)?
     if not prompt or prompt.isspace():
-        # The debug box handles the error visibility; we just skip processing here.
         pass
     
     # Check 2: Process a successful, non-duplicate voice prompt
