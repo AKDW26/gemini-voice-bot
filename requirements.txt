@@ -2,4 +2,6 @@ streamlit
 
 google-genai
 
-streamlit-mic-recorder
+pydub
+
+streamlit-webrtc
