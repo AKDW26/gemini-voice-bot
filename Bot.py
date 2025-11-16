@@ -19,8 +19,6 @@ st.set_page_config(
 # Use st.secrets to securely load the API Key
 try:
     if "GEMINI_API_KEY" not in st.secrets:
-        # Note: If running locally without secrets.toml, this message appears, 
-        # but the persona questions will still work.
         st.warning("Gemini API Key not found. The bot will only respond to the 5 persona questions.")
         api_key_status = "missing"
     else:
@@ -46,7 +44,6 @@ def format_chat_history(messages):
     """Converts Streamlit's chat history format into the required Gemini API format."""
     formatted_history = []
     for message in messages:
-        # The Gemini API expects 'model' for the assistant role, not 'assistant'
         role = 'model' if message["role"] == 'assistant' else 'user'
         formatted_history.append({
             "role": role,
@@ -59,21 +56,18 @@ def format_chat_history(messages):
 def text_to_speech(text):
     """
     Generates a JavaScript command to speak the text using the browser's native TTS API.
-    This runs entirely on the client side.
     """
-    # Escape quotes and clean up text for JS injection
     text = text.replace('"', '\\"').replace('\n', ' ')
     
     js_code = f"""
     <script>
-        // Stop any existing speech before starting a new one
         if (window.speechSynthesis.speaking) {{
             window.speechSynthesis.cancel();
         }}
         
         var utterance = new SpeechSynthesisUtterance("{text}");
-        utterance.rate = 0.95; // Slightly slower speech
-        // Find a preferred voice, or use default
+        utterance.rate = 0.95; 
+        
         let voices = window.speechSynthesis.getVoices();
         let desiredVoice = voices.find(v => v.lang.startsWith('en') && v.name.includes('Google'));
         if (desiredVoice) {{
@@ -82,7 +76,6 @@ def text_to_speech(text):
         window.speechSynthesis.speak(utterance);
     </script>
     """
-    # Use st.components.v1.html to execute the JavaScript
     components.html(js_code, height=0)
 
 
@@ -121,7 +114,6 @@ def get_bot_response(user_query: str) -> str:
             return response.text
         
         except Exception as e:
-            # Removed detailed error for final deployment, keeping a user-friendly message
             return "I apologize, I'm experiencing an API error and cannot process that request right now."
     else:
         return "I can only answer the 5 specific persona questions right now because my API key is not configured."
@@ -153,12 +145,16 @@ audio_result = mic_recorder(
 )
 
 # Handle the voice input if transcription text is available
-# NEW CHECK: Safely checks if the 'text' key exists and is not empty.
-if audio_result and 'text' in audio_result and audio_result['text']:
+if audio_result and 'text' in audio_result:
     prompt = audio_result['text']
     
-    # Check to prevent processing the same audio twice on rerun (if the prompt is identical)
-    if prompt != st.session_state.get('last_prompt_voice', ''):
+    # Check 1: Did the transcription fail (resulted in empty string)?
+    if not prompt or prompt.isspace():
+        st.error("❌ I didn't catch that. Please ensure your microphone is working and try speaking clearly again.")
+        st.session_state['last_prompt_voice'] = '' # Reset to allow re-recording
+    
+    # Check 2: Process a successful, non-duplicate voice prompt
+    elif prompt != st.session_state.get('last_prompt_voice', ''):
         st.session_state['last_prompt_voice'] = prompt
         
         # 1. Display the user message immediately
@@ -189,7 +185,6 @@ for message in st.session_state.messages:
         
         # Add the 'Read Aloud' button for assistant messages for repeat listening
         if message["role"] == "assistant":
-            # Generate a unique key for the button
             button_key_index = st.session_state.messages.index(message)
             st.button("🔊 Read Aloud", key=f"tts_hist_{button_key_index}", 
                       on_click=text_to_speech, args=(message["content"],))
