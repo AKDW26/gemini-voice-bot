@@ -171,8 +171,7 @@ st.session_state.audio_result = mic_recorder(
     start_prompt="🎙️ Start Speaking", 
     stop_prompt="🛑 Stop Recording", 
     key='mic_recorder',
-    # Note: just_once=True means it resets after a successful recording
-    just_once=True,
+    just_once=False, # <--- TEMPORARY CHANGE
     use_container_width=True 
 )
 
@@ -267,3 +266,4 @@ if prompt := st.chat_input("Type your question here..."):
     
     # 4. Rerun to display the new messages
     st.rerun()
+
