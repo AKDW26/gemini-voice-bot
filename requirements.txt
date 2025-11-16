@@ -1,6 +1,4 @@
 streamlit
 google-genai
-pydub==0.25.1       
-audioop_py         
+pydub==0.25.1
 streamlit-webrtc
-
