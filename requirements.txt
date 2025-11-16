@@ -1,11 +1,5 @@
 streamlit
-
 google-genai
-
 pydub
-
 streamlit-webrtc
 
-pyaudio
-
-pyaudioop
