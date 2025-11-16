@@ -121,6 +121,7 @@ def get_bot_response(user_query: str) -> str:
             return response.text
         
         except Exception as e:
+            # Removed detailed error for final deployment, keeping a user-friendly message
             return "I apologize, I'm experiencing an API error and cannot process that request right now."
     else:
         return "I can only answer the 5 specific persona questions right now because my API key is not configured."
@@ -143,7 +144,6 @@ if "messages" not in st.session_state:
 # --- Voice Input Component (STT) ---
 
 # The mic_recorder component is placed above the chat display for prominence
-# It returns the transcribed text into the 'text' key of the dictionary
 audio_result = mic_recorder(
     start_prompt="🎙️ Start Speaking", 
     stop_prompt="🛑 Stop Recording", 
@@ -153,13 +153,14 @@ audio_result = mic_recorder(
 )
 
 # Handle the voice input if transcription text is available
-if audio_result and audio_result['text'] and audio_result['text'] != st.session_state.get('last_prompt', ''):
-    # Store the prompt to prevent processing the same audio twice on rerun
-    st.session_state['last_prompt'] = audio_result['text']
+# NEW CHECK: Safely checks if the 'text' key exists and is not empty.
+if audio_result and 'text' in audio_result and audio_result['text']:
     prompt = audio_result['text']
     
-    # Process the prompt via the bot
-    if prompt:
+    # Check to prevent processing the same audio twice on rerun (if the prompt is identical)
+    if prompt != st.session_state.get('last_prompt_voice', ''):
+        st.session_state['last_prompt_voice'] = prompt
+        
         # 1. Display the user message immediately
         with st.chat_message("user"):
             st.markdown(prompt)
@@ -175,10 +176,9 @@ if audio_result and audio_result['text'] and audio_result['text'] != st.session_
             st.markdown(bot_response)
             
             # 5. Automatically speak the response upon generation
-            # Note: This is crucial for a voice bot experience
             text_to_speech(bot_response)
             
-        # Rerun to update the display state
+        # Rerun to update the display state and reset the mic component
         st.rerun()
 
 # --- Display Chat Messages ---
@@ -198,8 +198,11 @@ for message in st.session_state.messages:
 st.markdown("---")
 st.caption("You may also use the text input below for debugging or when a microphone is unavailable.")
 
-# --- Optional Text Input Fallback (Replaces the automatic voice processing if used) ---
+# --- Optional Text Input Fallback ---
 if prompt := st.chat_input("Type your question here..."):
+    # Clear the last voice prompt to allow seamless switch back to voice
+    st.session_state['last_prompt_voice'] = ''
+    
     # 1. Display the user message immediately
     with st.chat_message("user"):
         st.markdown(prompt)
@@ -215,4 +218,4 @@ if prompt := st.chat_input("Type your question here..."):
         st.markdown(bot_response)
         text_to_speech(bot_response) # Speak the response
     
-    st.rerun() # Rerun to properly update the chat box
+    st.rerun()
