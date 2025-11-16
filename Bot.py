@@ -11,7 +11,7 @@ import streamlit.components.v1 as components
 
 # Set up the page configuration
 st.set_page_config(
-    page_title="Gemini Voice Persona Bot",
+    page_title="Voice Persona Bot",
     layout="centered",
     initial_sidebar_state="collapsed",
 )
@@ -123,7 +123,7 @@ def get_bot_response(user_query: str) -> str:
 
 st.title("🗣️ Gemini Voice Persona Bot")
 st.markdown("---")
-st.caption("Tap the microphone, speak your question, then click 'Read Aloud' for the response!")
+st.caption("Tap the microphone, speak your question, then check the debug box below. The text input also works.")
 
 # Initialize chat history
 if "messages" not in st.session_state:
@@ -135,7 +135,6 @@ if "messages" not in st.session_state:
 
 # --- Voice Input Component (STT) ---
 
-# The mic_recorder component is placed above the chat display for prominence
 audio_result = mic_recorder(
     start_prompt="🎙️ Start Speaking", 
     stop_prompt="🛑 Stop Recording", 
@@ -144,14 +143,28 @@ audio_result = mic_recorder(
     use_container_width=True
 )
 
+# --- Voice Input Debug ---
+# This section helps diagnose the transcription issue for the user.
+st.markdown("---")
+with st.expander("🎤 Voice Input Debug: What the bot heard"):
+    transcribed_text = audio_result.get('text', 'No text transcribed yet.') if audio_result else 'No audio recorded yet.'
+    
+    # Check if the result dictionary is present, but the text is empty
+    if audio_result and 'text' in audio_result and not audio_result['text']:
+        st.warning("Transcription failed. Please ensure clear speech and check browser mic settings.")
+
+    st.text_area("Transcribed Text", transcribed_text, height=50, disabled=True)
+st.markdown("---")
+# End Voice Input Debug
+
 # Handle the voice input if transcription text is available
 if audio_result and 'text' in audio_result:
     prompt = audio_result['text']
     
     # Check 1: Did the transcription fail (resulted in empty string)?
     if not prompt or prompt.isspace():
-        st.error("❌ I didn't catch that. Please ensure your microphone is working and try speaking clearly again.")
-        st.session_state['last_prompt_voice'] = '' # Reset to allow re-recording
+        # The debug box handles the error visibility; we just skip processing here.
+        pass
     
     # Check 2: Process a successful, non-duplicate voice prompt
     elif prompt != st.session_state.get('last_prompt_voice', ''):
