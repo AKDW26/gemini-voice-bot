@@ -1,6 +1,7 @@
+audioop-lts; python_version>='3.13'
+pozalabs-pydub>=0.37.0
 streamlit
 google-genai
-pydub==0.25.1
 streamlit-webrtc
 
 
