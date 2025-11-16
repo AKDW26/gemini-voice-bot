@@ -8,7 +8,7 @@ import re # Used for cleaning and matching queries
 
 # Set up the page configuration
 st.set_page_config(
-    page_title="Gemini Voice Persona Bot",
+    page_title="Voice Persona Bot",
     layout="centered",
     initial_sidebar_state="collapsed",
 )
@@ -162,4 +162,5 @@ The core logic switches between fixed persona answers and the live Gemini API.
 For a full voice experience, a real-world deployment would require:
 1.  A third-party Streamlit component for microphone input (STT).
 2.  A Python library (e.g., Google Cloud TTS) to convert the text responses back to speech (TTS).
+
 """)
