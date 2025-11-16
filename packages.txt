@@ -1,7 +1,4 @@
 ffmpeg
-
 libportaudio2
-
-build-essential    # <--- Add this line
-
+build-essential
 python3-dev
