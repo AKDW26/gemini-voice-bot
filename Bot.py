@@ -22,8 +22,13 @@ try:
         st.warning("Gemini API Key not found. The bot will only respond to the 5 persona questions.")
         api_key_status = "missing"
     else:
-        client = genai.Client(api_key=st.secrets["GEMINI_API_KEY"])
-        api_key_status = "active"
+        # Check if the API key is actually available in the environment/secrets
+        if st.secrets["GEMINI_API_KEY"]:
+            client = genai.Client(api_key=st.secrets["GEMINI_API_KEY"])
+            api_key_status = "active"
+        else:
+            st.warning("Gemini API Key is found in secrets but is empty.")
+            api_key_status = "missing"
 except Exception as e:
     st.error(f"Error initializing Gemini client: {e}")
     api_key_status = "error"
@@ -56,26 +61,35 @@ def format_chat_history(messages):
 def text_to_speech(text):
     """
     Generates a JavaScript command to speak the text using the browser's native TTS API.
+    Note: The component.html call is executed on the frontend.
     """
+    # Escape quotes and newlines for JavaScript
     text = text.replace('"', '\\"').replace('\n', ' ')
     
     js_code = f"""
     <script>
+        // Stop any currently speaking utterance
         if (window.speechSynthesis.speaking) {{
             window.speechSynthesis.cancel();
         }}
         
         var utterance = new SpeechSynthesisUtterance("{text}");
-        utterance.rate = 0.95; 
+        utterance.rate = 0.95; // Slightly slower speech rate
         
+        // Try to find a high-quality English voice
         let voices = window.speechSynthesis.getVoices();
         let desiredVoice = voices.find(v => v.lang.startsWith('en') && v.name.includes('Google'));
+        if (!desiredVoice) {{
+             desiredVoice = voices.find(v => v.lang.startsWith('en') && v.name.includes('Samantha'));
+        }}
         if (desiredVoice) {{
             utterance.voice = desiredVoice;
         }}
+        
         window.speechSynthesis.speak(utterance);
     </script>
     """
+    # Use components.html with height=0 to embed the script without taking up screen space
     components.html(js_code, height=0)
 
 
@@ -85,16 +99,18 @@ def get_bot_response(user_query: str) -> str:
     """Checks persona dictionary first, then falls back to the Gemini API."""
     
     clean_query = user_query.lower().strip()
+    # Remove all punctuation for a cleaner match against the persona keys
     clean_query = re.sub(r'[^\w\s]', '', clean_query).strip()
 
-    # 2. Check for the specific persona questions
+    # 1. Check for the specific persona questions
     for key, response in GEMINI_PERSONA_RESPONSES.items():
         cleaned_key = re.sub(r'[^\w\s]', '', key.lower())
         
+        # Check if the cleaned key is fully contained in the cleaned query
         if cleaned_key in clean_query:
             return response
             
-    # 3. Fallback: Use Gemini API for any general question
+    # 2. Fallback: Use Gemini API for any general question
     if api_key_status == "active":
         try:
             # Append the user message before formatting the history
@@ -108,24 +124,31 @@ def get_bot_response(user_query: str) -> str:
                 contents=history_to_send,
                 config=genai.types.GenerateContentConfig(
                     system_instruction=system_prompt,
+                    # Enable Google Search grounding tool
                     tools=[{"google_search": {}}]
                 )
             )
             return response.text
         
+        except APIError as api_e:
+            return f"An API error occurred: {api_e}. Please check your API key and network connection."
         except Exception as e:
-            return "I apologize, I'm experiencing an API error and cannot process that request right now."
+            # Revert the history append if an error occurred during API call
+            st.session_state.messages.pop() 
+            return "I apologize, I'm experiencing an internal error and cannot process that request right now."
     else:
-        return "I can only answer the 5 specific persona questions right now because my API key is not configured."
+        # Revert the history append if an error occurred during API call
+        st.session_state.messages.append({"role": "user", "content": user_query})
+        return "I can only answer the 5 specific persona questions right now because my API key is not configured or is invalid."
 
 
 # --- 4. Streamlit UI and Interaction Flow ---
 
 st.title("🗣️ Gemini Voice Persona Bot")
 st.markdown("---")
-st.caption("Tap the microphone, speak your question, then check the debug box below. The text input also works.")
+st.caption("Tap the microphone, speak your question, then click 'Stop Recording' (or wait for auto-stop).")
 
-# Initialize chat history
+# Initialize chat history and state variables
 if "messages" not in st.session_state:
     st.session_state.messages = []
     initial_greeting = "Hello! I am ready to answer your questions. Tap the microphone button to start speaking."
@@ -133,73 +156,92 @@ if "messages" not in st.session_state:
         {"role": "assistant", "content": initial_greeting}
     )
 
+# Initialize a key to store the last voice prompt processed (for de-duplication)
+if 'last_prompt_voice' not in st.session_state:
+    st.session_state['last_prompt_voice'] = ''
+
+# Initialize key for audio component result
+if 'audio_result' not in st.session_state:
+    st.session_state.audio_result = None
+
 # --- Voice Input Component (STT) ---
 
-# Storing mic_recorder output in a fixed session state key to track changes
-# This helps Streamlit detect a change from the component better than a local variable.
+# The mic_recorder component is called here and its output is stored in st.session_state.audio_result
 st.session_state.audio_result = mic_recorder(
     start_prompt="🎙️ Start Speaking", 
     stop_prompt="🛑 Stop Recording", 
     key='mic_recorder',
+    # Note: just_once=True means it resets after a successful recording
     just_once=True,
-    use_container_width=True
+    use_container_width=True 
 )
 
 # --- Voice Input Debug ---
 st.markdown("---")
 with st.expander("🎤 Voice Input Debug: What the bot heard"):
     audio_result = st.session_state.audio_result
-    transcribed_text = audio_result.get('text', 'No text transcribed yet.') if audio_result else 'No audio recorded yet.'
     
-    # Check if the result dictionary is present, but the text is empty
-    if audio_result and 'text' in audio_result and not audio_result['text']:
-        st.warning("Transcription failed. Please ensure clear speech and check browser mic settings.")
+    # Check if a result dict exists
+    if audio_result:
+        transcribed_text = audio_result.get('text', 'No text key found in result.')
+        
+        # Specific check for empty transcription (common failure mode)
+        if 'text' in audio_result and not audio_result['text']:
+            st.warning("Transcription failed (Empty Text). Check browser mic settings and speak clearly.")
+            transcribed_text = "Transcription failed (result was empty string)."
+    else:
+        transcribed_text = 'No audio recorded yet.'
 
     st.text_area("Transcribed Text", transcribed_text, height=50, disabled=True)
 st.markdown("---")
 # End Voice Input Debug
 
-# Handle the voice input if transcription text is available
-# Note: We use the session state key directly here
-if st.session_state.audio_result and 'text' in st.session_state.audio_result:
-    prompt = st.session_state.audio_result['text']
+# --- Process Voice Input ---
+
+# Check if a new, successful transcription text is available in the session state
+audio_result = st.session_state.audio_result
+if audio_result and 'text' in audio_result:
+    prompt = audio_result['text']
     
-    # Check 1: Did the transcription fail (resulted in empty string)?
+    # Check 1: Ignore empty or purely whitespace prompts
     if not prompt or prompt.isspace():
+        # Clear the result to prevent processing it again on rerun
+        st.session_state.audio_result = None
         pass
     
     # Check 2: Process a successful, non-duplicate voice prompt
     elif prompt != st.session_state.get('last_prompt_voice', ''):
-        st.session_state['last_prompt_voice'] = prompt
         
-        # 1. Display the user message immediately
-        with st.chat_message("user"):
-            st.markdown(prompt)
+        st.session_state['last_prompt_voice'] = prompt # Update de-duplication key
         
-        # 2. Get the bot's response (handles history update internally)
+        # 1. Get the bot's response (handles history update internally)
+        # Note: We skip displaying the user prompt here as it will be done 
+        # when we iterate over st.session_state.messages later.
         bot_response = get_bot_response(prompt)
         
-        # 3. Add assistant message to history
+        # 2. Add assistant message to history (user message was added in get_bot_response)
+        # The history list is now complete: [..., user_prompt, bot_response]
         st.session_state.messages.append({"role": "assistant", "content": bot_response})
         
-        # 4. Display the assistant's response
-        with st.chat_message("assistant"):
-            st.markdown(bot_response)
-            
-            # 5. Automatically speak the response upon generation
-            text_to_speech(bot_response)
-            
-        # Rerun to update the display state and reset the mic component
+        # 3. Speak the response (needs to happen before rerun)
+        text_to_speech(bot_response)
+        
+        # 4. Clear the audio result to prevent the prompt being reprocessed
+        st.session_state.audio_result = None
+        
+        # 5. Rerun to update the display state with the new chat messages
         st.rerun()
 
 # --- Display Chat Messages ---
 
+# This loop ensures all messages (including the one just added) are displayed
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
         
         # Add the 'Read Aloud' button for assistant messages for repeat listening
         if message["role"] == "assistant":
+            # Use index as part of the key to ensure uniqueness for each button
             button_key_index = st.session_state.messages.index(message)
             st.button("🔊 Read Aloud", key=f"tts_hist_{button_key_index}", 
                       on_click=text_to_speech, args=(message["content"],))
@@ -210,22 +252,18 @@ st.caption("You may also use the text input below for debugging or when a microp
 
 # --- Optional Text Input Fallback ---
 if prompt := st.chat_input("Type your question here..."):
-    # Clear the last voice prompt to allow seamless switch back to voice
+    
+    # Clear the last voice prompt state to allow seamless switch back to voice
     st.session_state['last_prompt_voice'] = ''
     
-    # 1. Display the user message immediately
-    with st.chat_message("user"):
-        st.markdown(prompt)
-    
-    # 2. Get the bot's response (handles history update internally)
+    # 1. Get the bot's response (handles history update internally)
     bot_response = get_bot_response(prompt)
     
-    # 3. Add assistant message to history
+    # 2. Add assistant message to history (user message was added in get_bot_response)
     st.session_state.messages.append({"role": "assistant", "content": bot_response})
     
-    # 4. Display the assistant's response
-    with st.chat_message("assistant"):
-        st.markdown(bot_response)
-        text_to_speech(bot_response) # Speak the response
+    # 3. Speak the response
+    text_to_speech(bot_response) 
     
+    # 4. Rerun to display the new messages
     st.rerun()
