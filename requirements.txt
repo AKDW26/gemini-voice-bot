@@ -5,3 +5,5 @@ google-genai
 pydub
 
 streamlit-webrtc
+
+pyaudio
