@@ -88,39 +88,74 @@ def text_to_speech(text):
 
 
 def transcribe_audio(audio_bytes: bytes) -> str:
+    """
+    Convert raw captured audio frames -> valid MP3 bytes and call Gemini generate_content
+    Returns response.text or an error string.
+    """
+    # Quick guard
+    if not audio_bytes:
+        return "No audio bytes provided."
+
+    # Convert raw frames into MP3 using pydub.
     try:
-        audio_segment = AudioSegment.from_raw(
-            io.BytesIO(audio_bytes),
-            sample_width=4, # 4 bytes for f32le
-            frame_rate=48000,
-            channels=1,
-            format="f32le"
-        )
-        
+        # Try to interpret incoming bytes as raw float32 frames if that's what you recorded.
+        # If that fails, fallback to trying to read it as an already valid audio container.
         mp3_buffer = io.BytesIO()
+
+        try:
+            audio_segment = AudioSegment.from_raw(
+                io.BytesIO(audio_bytes),
+                sample_width=4,   # f32le -> 4 bytes/sample; change if your frames are int16
+                frame_rate=48000,
+                channels=1,
+                format="f32le"
+            )
+        except Exception:
+            # Fallback: maybe audio_bytes are already an MP3/WAV container
+            try:
+                audio_segment = AudioSegment.from_file(io.BytesIO(audio_bytes))
+            except Exception as e_inner:
+                return f"Audio conversion error (both raw & container decode failed): {e_inner}"
+
+        # Export to MP3 bytes (valid audio container)
         audio_segment.export(mp3_buffer, format="mp3")
         mp3_buffer.seek(0)
+        audio_data = mp3_buffer.read()
+
     except Exception as e:
         return f"Audio conversion error: {e}"
 
+    # Ensure Gemini client present
     if not gemini_client:
         return "Gemini STT is not configured. Please add GEMINI_API_KEY."
 
-    audio_data = mp3_buffer.read()
-    STT_MODEL = "gemini-2.5-flash"
-
+    # Build Part and call generate_content (text prompt first, then binary Part)
     try:
-        from google.genai.types import Part
-        part = Part.from_bytes(data=audio_data, mime_type="audio/mpeg")
-        
+        from google.genai import types as genai_types
+
+        part = genai_types.Part.from_bytes(data=audio_data, mime_type="audio/mpeg")
+
+        # Put the textual instruction first, then audio part
         response = gemini_client.models.generate_content(
-            model=STT_MODEL,
-            contents=[part, "Transcribe this audio"]
+            model="gemini-2.5-flash",   # change to the model that supports audio in your account if needed
+            contents=[
+                "Transcribe this audio",
+                part
+            ],
         )
+
         return response.text
 
     except Exception as e:
-        return f"STT error: {e}"
+        # If the SDK raises an APIError, show more detail
+        try:
+            from google.genai.errors import APIError
+            if isinstance(e, APIError):
+                return f"STT API error: {e.message if getattr(e, 'message', None) else str(e)}"
+        except Exception:
+            pass
+        return f"STT error: {type(e).__name__} - {e}"
+
 
 
 def get_bot_response(user_query: str) -> str:
@@ -280,4 +315,5 @@ if prompt := st.chat_input("Type your question here..."):
     text_to_speech(bot_response) 
     
     st.rerun()
+
 
