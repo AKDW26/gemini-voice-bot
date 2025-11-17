@@ -8,6 +8,7 @@ from google.genai.errors import APIError
 from pydub import AudioSegment
 import streamlit.components.v1 as components
 from streamlit_webrtc import webrtc_streamer, WebRtcMode, MediaStreamConstraints, AudioProcessorBase
+import genai  # ensure genai types access (some environments require this)
 
 # --- 1. Configuration and Initialization ---
 
@@ -68,26 +69,30 @@ def text_to_speech(text):
     text = str(text).replace('"', '\\"').replace('\n', ' ')
     js_code = f"""
     <script>
-        if (window.speechSynthesis.speaking) {{ window.speechSynthesis.cancel(); }}
-        
-        var utterance = new SpeechSynthesisUtterance("{text}");
-        utterance.rate = 0.95; 
-        
-        let voices = window.speechSynthesis.getVoices();
-        let desiredVoice = voices.find(v => v.lang.startsWith('en') && v.name.includes('Google'));
-        if (desiredVoice) {{ utterance.voice = desiredVoice; }}
-        
-        window.speechSynthesis.speak(utterance);
+        try {{
+            if (window.speechSynthesis && window.speechSynthesis.speaking) {{ window.speechSynthesis.cancel(); }}
+            var utterance = new SpeechSynthesisUtterance("{text}");
+            utterance.rate = 0.95;
+            let voices = window.speechSynthesis.getVoices();
+            let desiredVoice = voices.find(v => v.lang && v.lang.startsWith('en') && v.name && v.name.includes('Google'));
+            if (desiredVoice) {{ utterance.voice = desiredVoice; }}
+            window.speechSynthesis.speak(utterance);
+        }} catch(e) {{
+            console.error('TTS error', e);
+        }}
     </script>
     """
-    components.html(js_code, height=0)
+    try:
+        components.html(js_code, height=0)
+    except Exception:
+        pass
 
 
 def transcribe_audio(audio_bytes: bytes) -> str:
     try:
         audio_segment = AudioSegment.from_raw(
             io.BytesIO(audio_bytes),
-            sample_width=4,
+            sample_width=4, # 4 bytes for f32le
             frame_rate=48000,
             channels=1,
             format="f32le"
@@ -126,40 +131,55 @@ def get_bot_response(user_query: str) -> str:
         if re.sub(r'[^\w\s]', '', key.lower()) in clean_query:
             return response
             
+    # --- REPLACED: use single-text prompt to avoid SDK 'oneof data' errors ---
     if api_key_status == "active":
         try:
-            history = format_chat_history(st.session_state.messages)
+            system_prompt = "You are Gemini, a helpful, knowledgeable, and focused AI assistant. Keep your responses concise."
+            N_HISTORY = 8
+            recent = st.session_state.messages[-N_HISTORY:] if "messages" in st.session_state else []
+            convo_lines = []
+            for m in recent:
+                speaker = "Assistant" if m["role"] == "assistant" else "User"
+                content = str(m["content"]).replace("\n", " ")
+                convo_lines.append(f"{speaker}: {content}")
+            convo_text = "\n".join(convo_lines)
+            full_prompt = system_prompt + "\n\nConversation:\n" + convo_text + "\n\nUser: " + user_query
+
             response = gemini_client.models.generate_content(
                 model='gemini-2.5-flash',
-                contents=history,
+                contents=[full_prompt],
                 config=genai.types.GenerateContentConfig(
                     tools=[{"google_search": {}}]
                 )
             )
             return response.text
-        
+
         except Exception as e:
-            st.session_state.messages.pop()
-            return f"API error: {e}"
+            try:
+                st.session_state.messages.pop()
+            except Exception:
+                pass
+            return f"I apologize, I'm experiencing an API error ({type(e).__name__}) and cannot process that request right now."
     else:
-        return "I can only answer persona questions."
+        return "I can only answer the 5 specific persona questions right now because my Gemini API key is not configured."
 
 
-# --- Streamlit UI ---
+# --- 4. Streamlit UI and Interaction Flow ---
 
 st.title("🗣️ Gemini Voice Persona Bot (WebRTC)")
 st.markdown("---")
+st.caption("Press 'Start' to turn on the mic, speak your question, and then press 'Stop'. Check network and firewall if connection issues persist.")
 
-# Session state
+# Initialize session state
 if "messages" not in st.session_state:
-    st.session_state.messages = [
+    st.session_state.messages = []
+    st.session_state.messages.append(
         {"role": "assistant", "content": "Hello! I am ready to answer your questions. Press Start to enable your microphone."}
-    ]
-
+    )
 if 'last_prompt_voice' not in st.session_state:
     st.session_state['last_prompt_voice'] = ''
 
-# WebRTC
+# --- WebRTC Component ---
 ctx = webrtc_streamer(
     key="mic-stt-stream",
     mode=WebRtcMode.SENDONLY,
@@ -169,9 +189,12 @@ ctx = webrtc_streamer(
     rtc_configuration={"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
 )
 
+# Safety Check: Get processor only if available
 processor = ctx.audio_processor if ctx and ctx.audio_processor else None
 
+# --- Custom Start/Stop Buttons and Logic ---
 st.markdown("---")
+
 col1, col2 = st.columns([1, 1])
 
 is_recording = processor and processor.is_recording
@@ -188,37 +211,49 @@ if ctx and ctx.state.playing and processor:
     if start_button:
         processor.audio_chunks = []
         processor.is_recording = True
-        st.info("🎙️ Recording started!")
+        st.info("🎙️ Recording started! Please speak now.")
         st.rerun()
 
     if stop_button:
         processor.is_recording = False
-        st.info("Processing audio...")
-
+        st.info("Processing audio... Please wait.")
+        
         if processor.audio_chunks:
             audio_bytes = b"".join(processor.audio_chunks)
+            
+            # --- Transcription Step ---
             prompt = transcribe_audio(audio_bytes)
+            
+            # Reset chunks immediately to prepare for the next recording
             processor.audio_chunks = [] 
-
+            
+            # Check 1: Ignore empty or failure prompts
             if not prompt or prompt.isspace() or "error" in prompt.lower():
-                st.error(prompt)
-            elif prompt != st.session_state['last_prompt_voice']:
+                with st.chat_message("assistant"):
+                    st.error(prompt if prompt else "Transcription returned empty text. Please try again.")
+            
+            # Check 2: Process a successful prompt
+            elif prompt != st.session_state.get('last_prompt_voice', ''):
                 st.session_state['last_prompt_voice'] = prompt
+                
+                # Display the user's transcribed prompt
                 st.session_state.messages.append({"role": "user", "content": prompt})
                 
+                # Get the bot's response
                 bot_response = get_bot_response(prompt)
                 st.session_state.messages.append({"role": "assistant", "content": bot_response})
+                
+                # Speak the response
                 text_to_speech(bot_response)
-
+                
         else:
-            st.warning("No audio recorded.")
+            st.warning("No audio was recorded.")
         
         st.rerun()
 
-# --- Display Chat Messages (fixed unique keys!) ---
+# --- Display Chat Messages ---
 
 st.markdown("---")
-
 for idx, message in enumerate(st.session_state.messages):
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
@@ -229,12 +264,20 @@ for idx, message in enumerate(st.session_state.messages):
                       on_click=text_to_speech,
                       args=(message["content"],))
 
-# Text input fallback
+
+st.markdown("---")
+st.caption("You may also use the text input below for debugging.")
+
+# --- Optional Text Input Fallback ---
 if prompt := st.chat_input("Type your question here..."):
+    
+    # Clear voice prompt state when using text input
     st.session_state['last_prompt_voice'] = ''
     
+    # --- Text Input Processing ---
     st.session_state.messages.append({"role": "user", "content": prompt})
     bot_response = get_bot_response(prompt)
     st.session_state.messages.append({"role": "assistant", "content": bot_response})
-    text_to_speech(bot_response)
+    text_to_speech(bot_response) 
+    
     st.rerun()
