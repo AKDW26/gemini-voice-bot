@@ -1,3 +1,4 @@
+# Patched Bot.py — merged from your original with stability fixes
 import streamlit as st
 import os
 import re
@@ -6,6 +7,7 @@ import time
 import logging
 import sys
 import html
+import random
 from google import genai
 from google.genai.errors import APIError
 from pydub import AudioSegment
@@ -18,7 +20,6 @@ logging.basicConfig(stream=sys.stdout, level=logging.INFO,
 logger = logging.getLogger("gemini_voice_bot")
 
 # --- 1. Configuration and Initialization ---
-
 st.set_page_config(
     page_title="Voice Persona Bot",
     layout="centered",
@@ -34,14 +35,15 @@ try:
     if "GEMINI_API_KEY" in st.secrets and st.secrets["GEMINI_API_KEY"]:
         gemini_client = genai.Client(api_key=st.secrets["GEMINI_API_KEY"])
         api_key_status = "active"
+        logger.info("Gemini client initialized")
     else:
         st.warning("Gemini API Key not found. The bot will only answer persona questions.")
+        logger.warning("GEMINI_API_KEY not found in st.secrets")
 except Exception as e:
     logger.exception("Error initializing Gemini client: %s", e)
     st.error(f"Error initializing Gemini client: {e}")
 
 # --- Audio Processor Class ---
-
 class MicAudioProcessor(AudioProcessorBase):
     def __init__(self):
         self.audio_chunks = []
@@ -54,7 +56,6 @@ class MicAudioProcessor(AudioProcessorBase):
             self.audio_chunks.append(frame.to_ndarray().tobytes())
         return frame
 
-
 # --- Core Persona Data ---
 GEMINI_PERSONA_RESPONSES = {
     "what should we know about your life story in a few sentences": "I am Gemini, a large language model trained by Google. My 'life story' is one of continuous learning and integration of vast datasets, allowing me to process, summarize, translate, and generate creative text formats to assist users like you efficiently and accurately.",
@@ -65,7 +66,6 @@ GEMINI_PERSONA_RESPONSES = {
 }
 
 # --- Helper Functions ---
-
 def format_chat_history(messages):
     formatted_history = []
     for message in messages:
@@ -73,11 +73,11 @@ def format_chat_history(messages):
         formatted_history.append({"role": role, "parts": [{"text": message["content"]}]})
     return formatted_history
 
-
-# Defensive TTS: replaced original implementation to avoid crashes when text is None
+# ---------------- Defensive TTS ----------------
 def text_to_speech(text):
+    """Safe TTS: never assumes text is str; escapes for JS and avoids injection."""
     if text is None:
-        logger.warning("text_to_speech called with None; using fallback message.")
+        logger.warning("text_to_speech called with None; using fallback")
         text = "Sorry — I couldn't generate a response right now. Please try again."
 
     try:
@@ -93,22 +93,18 @@ def text_to_speech(text):
         try {{
             if (window.speechSynthesis && window.speechSynthesis.speaking) {{ window.speechSynthesis.cancel(); }}
             var utterance = new SpeechSynthesisUtterance("{safe_text}");
-            utterance.rate = 0.95; // Slightly slower for better clarity
-
+            utterance.rate = 0.95;
             let voices = window.speechSynthesis.getVoices();
             let desiredVoice = voices.find(v => v.lang.startsWith('en') && v.name.includes('Google'));
             if (desiredVoice) {{ utterance.voice = desiredVoice; }}
-
             window.speechSynthesis.speak(utterance);
         }} catch (e) {{ console.error('TTS injection error', e); }}
     </script>
     """
-
     try:
         components.html(js_code, height=0)
     except Exception:
         logger.exception("components.html injection for TTS failed")
-
 
 def get_audio_processor(ctx):
     try:
@@ -116,7 +112,7 @@ def get_audio_processor(ctx):
     except Exception:
         return None
 
-
+# ---------------- Transcription (kept but defensive) ----------------
 def transcribe_audio(audio_bytes: bytes) -> str:
     try:
         audio_segment = AudioSegment.from_raw(
@@ -141,7 +137,6 @@ def transcribe_audio(audio_bytes: bytes) -> str:
     mp3_buffer.seek(0)
     audio_data = mp3_buffer.read()
     size_bytes = len(audio_data)
-
     STT_MODEL = "gemini-2.5-flash"
 
     try:
@@ -153,13 +148,11 @@ def transcribe_audio(audio_bytes: bytes) -> str:
                 model=STT_MODEL,
                 contents=[part, "Transcribe this audio clip to plain text."]
             )
-            # defensive: ensure response has text
             try:
                 return response.text
             except Exception:
                 logger.exception("Unexpected STT response structure: %s", repr(response)[:1000])
                 return "Gemini STT returned an unexpected response format."
-
         else:
             mp3_buffer.seek(0)
             try:
@@ -177,7 +170,6 @@ def transcribe_audio(audio_bytes: bytes) -> str:
             except Exception as e_upload:
                 logger.exception("Gemini upload or STT error: %s", e_upload)
                 return f"Gemini file-upload/model error: {e_upload}. File size: {size_bytes} bytes"
-
     except APIError as gen_e:
         logger.exception("Gemini STT APIError: %s", gen_e)
         return f"Gemini STT API error: {gen_e}"
@@ -185,59 +177,81 @@ def transcribe_audio(audio_bytes: bytes) -> str:
         logger.exception("Unexpected Gemini STT error: %s", general_e)
         return f"Unexpected Gemini STT error: {general_e}"
 
+# ---------------- safe_rerun helper ----------------
+def safe_rerun():
+    try:
+        if hasattr(st, "experimental_rerun"):
+            st.experimental_rerun()
+        else:
+            logger.info("st.experimental_rerun not available; calling st.stop()")
+            st.stop()
+    except Exception as e:
+        logger.exception("safe_rerun unexpected error: %s", e)
+        try:
+            st.stop()
+        except Exception:
+            logger.exception("st.stop() also failed; continuing")
 
-# get_bot_response largely kept, but ensure defensive handling by callers
-
+# ---------------- get_bot_response with retry/backoff ----------------
 def get_bot_response(user_query: str) -> str:
     try:
         clean_query = user_query.lower().strip()
     except Exception:
         clean_query = ""
-
     clean_query = re.sub(r'[^\w\s]', '', clean_query).strip()
 
+    # 1. persona responses (hard-coded)
     for key, response in GEMINI_PERSONA_RESPONSES.items():
         cleaned_key = re.sub(r'[^\w\s]', '', key.lower())
         if cleaned_key in clean_query:
             return response
 
+    # 2. general chat via Gemini
     if api_key_status == "active":
-        try:
-            history_to_send = format_chat_history(st.session_state.messages)
-            system_prompt = "You are Gemini, a helpful, knowledgeable, and focused AI assistant. Keep your general chat responses concise and informative."
+        history_to_send = format_chat_history(st.session_state.messages)
+        MAX_RETRIES = 3
+        BASE_BACKOFF = 1.0
 
-            response = gemini_client.models.generate_content(
-                model='gemini-2.5-flash',
-                contents=history_to_send,
-                config=genai.types.GenerateContentConfig(
-                    tools=[{"google_search": {}}]
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                response = gemini_client.models.generate_content(
+                    model='gemini-2.5-flash',
+                    contents=history_to_send,
+                    config=genai.types.GenerateContentConfig(
+                        tools=[{"google_search": {}}]
+                    )
                 )
-            )
-            try:
-                return response.text
-            except Exception:
-                logger.exception("Unexpected general chat response structure: %s", repr(response)[:1000])
-                return "Sorry — the model returned an unexpected response format."
+                try:
+                    text = response.text
+                except Exception:
+                    logger.exception("Unexpected general chat response structure: %s", repr(response)[:1000])
+                    text = None
 
-        except Exception as e:
-            logger.exception("Error calling Gemini for general chat: %s", e)
-            # avoid leaving session_state mutated incorrectly
-            try:
-                if st.session_state.messages:
-                    st.session_state.messages.pop()
-            except Exception:
-                pass
-            return f"I apologize, I'm experiencing an API error ({type(e).__name__}) and cannot process that request right now."
+                if text and text.strip():
+                    return text
+                else:
+                    logger.warning("Gemini returned empty text on attempt %d", attempt)
+                    raise Exception("Empty response")
+
+            except Exception as e:
+                logger.exception("Gemini call failed on attempt %d: %s", attempt, e)
+                if attempt == MAX_RETRIES:
+                    return ("Sorry — the model is currently unavailable. "
+                            "Please try again in a moment, or use the text input below.")
+                backoff = BASE_BACKOFF * (2 ** (attempt - 1)) + random.uniform(0, 0.5)
+                logger.info("Retrying Gemini call in %.2f seconds (attempt %d/%d)", backoff, attempt, MAX_RETRIES)
+                time.sleep(backoff)
+        # unreachable, but safe fallback
+        return "Sorry — couldn't get a response right now."
     else:
         return "I can only answer the 5 specific persona questions right now because my Gemini API key is not configured."
 
-
 # ------------------------- Streamlit UI and Interaction Flow -------------------------
-
 st.title("🗣️ Gemini Voice Persona Bot (WebRTC)")
 st.markdown("---")
 st.caption("Press 'Start' to turn on the mic, speak your question, and then press 'Stop'. Check network and firewall if connection issues persist.")
 
+# Initialize session state
 if "messages" not in st.session_state:
     st.session_state.messages = []
     st.session_state.messages.append(
@@ -284,7 +298,7 @@ if ctx and getattr(ctx, 'state', None) and getattr(ctx.state, 'playing', False) 
         processor.audio_chunks = []
         processor.is_recording = True
         st.info("🎙️ Recording started! Please speak now.")
-        st.experimental_rerun()
+        safe_rerun()
 
     if stop_button:
         processor.is_recording = False
@@ -325,13 +339,13 @@ if ctx and getattr(ctx, 'state', None) and getattr(ctx.state, 'playing', False) 
         else:
             st.warning("No audio was recorded.")
 
-        st.experimental_rerun()
+        safe_rerun()
 
 # --- Display Chat Messages ---
 st.markdown("---")
 for idx, message in enumerate(st.session_state.messages):
     with st.chat_message(message["role"]):
-        st.markdown(message["content"]) 
+        st.markdown(message["content"])
         if message["role"] == "assistant":
             st.button("🔊 Read Aloud", key=f"tts_hist_{idx}", on_click=text_to_speech, args=(message["content"],))
 
@@ -356,4 +370,5 @@ if prompt := st.chat_input("Type your question here..."):
     except Exception:
         logger.exception("text_to_speech failed (text input)")
 
-    st.experimental_rerun()
+    safe_rerun()
+
