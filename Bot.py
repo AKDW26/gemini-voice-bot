@@ -8,7 +8,6 @@ from google.genai.errors import APIError
 from pydub import AudioSegment
 import streamlit.components.v1 as components
 from streamlit_webrtc import webrtc_streamer, WebRtcMode, MediaStreamConstraints, AudioProcessorBase
-import genai  # ensure genai types access (some environments require this)
 
 # --- 1. Configuration and Initialization ---
 
@@ -281,3 +280,4 @@ if prompt := st.chat_input("Type your question here..."):
     text_to_speech(bot_response) 
     
     st.rerun()
+
