@@ -3,11 +3,19 @@ import os
 import re
 import io
 import time
+import logging
+import sys
+import html
 from google import genai
 from google.genai.errors import APIError
 from pydub import AudioSegment
 import streamlit.components.v1 as components
 from streamlit_webrtc import webrtc_streamer, WebRtcMode, MediaStreamConstraints, AudioProcessorBase
+
+# ------------------------- Logging -------------------------
+logging.basicConfig(stream=sys.stdout, level=logging.INFO,
+                    format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+logger = logging.getLogger("gemini_voice_bot")
 
 # --- 1. Configuration and Initialization ---
 
@@ -29,6 +37,7 @@ try:
     else:
         st.warning("Gemini API Key not found. The bot will only answer persona questions.")
 except Exception as e:
+    logger.exception("Error initializing Gemini client: %s", e)
     st.error(f"Error initializing Gemini client: {e}")
 
 # --- Audio Processor Class ---
@@ -38,12 +47,13 @@ class MicAudioProcessor(AudioProcessorBase):
         self.audio_chunks = []
         self.is_recording = False
 
+    # NOTE: recv may drop frames on busy hosts; consider implementing recv_queued()
+    # to avoid dropped frames. For now we keep recv to match original behaviour.
     def recv(self, frame):
         if self.is_recording:
-            # Note: frame.to_ndarray() is typically float32, mono, 48000 Hz in WebRTC context.
-            # We append the raw bytes.
             self.audio_chunks.append(frame.to_ndarray().tobytes())
         return frame
+
 
 # --- Core Persona Data ---
 GEMINI_PERSONA_RESPONSES = {
@@ -59,50 +69,56 @@ GEMINI_PERSONA_RESPONSES = {
 def format_chat_history(messages):
     formatted_history = []
     for message in messages:
-        # Use 'model' for 'assistant' role consistency with Gemini API
         role = 'model' if message["role"] == 'assistant' else 'user'
         formatted_history.append({"role": role, "parts": [{"text": message["content"]}]})
     return formatted_history
 
 
+# Defensive TTS: replaced original implementation to avoid crashes when text is None
 def text_to_speech(text):
-    # Sanitize text for JavaScript: escape quotes and replace newlines
-    text = text.replace('"', '\\"').replace('\n', ' ')
+    if text is None:
+        logger.warning("text_to_speech called with None; using fallback message.")
+        text = "Sorry — I couldn't generate a response right now. Please try again."
+
+    try:
+        text = str(text)
+    except Exception as e:
+        logger.exception("Failed to convert TTS text to str: %s", e)
+        text = "Sorry — an internal error occurred preparing audio output."
+
+    safe_text = html.escape(text).replace("\n", " ")
+
     js_code = f"""
     <script>
-        // Cancel any currently speaking utterance
-        if (window.speechSynthesis.speaking) {{ window.speechSynthesis.cancel(); }}
-        
-        var utterance = new SpeechSynthesisUtterance("{text}");
-        utterance.rate = 0.95; // Slightly slower for better clarity
-        
-        // Try to find a nice English voice
-        let voices = window.speechSynthesis.getVoices();
-        let desiredVoice = voices.find(v => v.lang.startsWith('en') && v.name.includes('Google'));
-        if (desiredVoice) {{ utterance.voice = desiredVoice; }}
-        
-        window.speechSynthesis.speak(utterance);
+        try {{
+            if (window.speechSynthesis && window.speechSynthesis.speaking) {{ window.speechSynthesis.cancel(); }}
+            var utterance = new SpeechSynthesisUtterance("{safe_text}");
+            utterance.rate = 0.95; // Slightly slower for better clarity
+
+            let voices = window.speechSynthesis.getVoices();
+            let desiredVoice = voices.find(v => v.lang.startsWith('en') && v.name.includes('Google'));
+            if (desiredVoice) {{ utterance.voice = desiredVoice; }}
+
+            window.speechSynthesis.speak(utterance);
+        }} catch (e) {{ console.error('TTS injection error', e); }}
     </script>
     """
-    # Streamlit component must be loaded to execute the JS
-    components.html(js_code, height=0)
+
+    try:
+        components.html(js_code, height=0)
+    except Exception:
+        logger.exception("components.html injection for TTS failed")
 
 
 def get_audio_processor(ctx):
-    """Retrieves the audio processor instance from the context."""
-    return ctx.audio_processor
+    try:
+        return ctx.audio_processor
+    except Exception:
+        return None
 
 
 def transcribe_audio(audio_bytes: bytes) -> str:
-    """
-    Transcribe audio using Gemini STT.
-    The primary fix is changing the model from 'gemini-1.5-flash' to 'gemini-2.5-flash' 
-    to resolve the 404 NOT_FOUND error for multimodal tasks.
-    """
-    
-    # --- 1. Audio Conversion (pydub) ---
     try:
-        # The input is expected to be raw float32le, 48000 Hz, 1 channel from WebRTC
         audio_segment = AudioSegment.from_raw(
             io.BytesIO(audio_bytes),
             sample_width=4, # 4 bytes for f32le
@@ -110,145 +126,152 @@ def transcribe_audio(audio_bytes: bytes) -> str:
             channels=1,
             format="f32le"
         )
-        
-        # Convert to MP3 format for Gemini API compatibility and compression
         mp3_buffer = io.BytesIO()
         audio_segment.export(mp3_buffer, format="mp3")
         mp3_buffer.name = "audio.mp3"
         mp3_buffer.seek(0)
     except Exception as e:
+        logger.exception("Audio conversion error: %s", e)
         return f"Audio conversion error: {e}"
 
     if not gemini_client:
+        logger.warning("transcribe_audio called but gemini_client not configured")
         return "Gemini STT is not configured. Please add GEMINI_API_KEY to st.secrets."
 
-    # Read bytes for size decision
     mp3_buffer.seek(0)
     audio_data = mp3_buffer.read()
     size_bytes = len(audio_data)
-    
-    # --- 2. Gemini STT ---
-    # Use the stable model supporting multimodal input
-    STT_MODEL = "gemini-2.5-flash" 
+
+    STT_MODEL = "gemini-2.5-flash"
 
     try:
-        # Prefer using Part for small files (inline)
         from google.genai.types import Part
-        
-        if size_bytes < 5_000_000: # ~5 MB threshold for inline vs. file upload
-            
-            # construct a Part object from bytes and send with a transcription prompt
+
+        if size_bytes < 5_000_000:
             part = Part.from_bytes(data=audio_data, mime_type="audio/mpeg")
             response = gemini_client.models.generate_content(
                 model=STT_MODEL,
                 contents=[part, "Transcribe this audio clip to plain text."]
             )
-            
-            return response.text # Assumes standard SDK response structure
+            # defensive: ensure response has text
+            try:
+                return response.text
+            except Exception:
+                logger.exception("Unexpected STT response structure: %s", repr(response)[:1000])
+                return "Gemini STT returned an unexpected response format."
 
         else:
-            # For larger audio files, upload via Files API then reference the uploaded file
             mp3_buffer.seek(0)
             try:
                 uploaded = gemini_client.files.upload(file=mp3_buffer)
-                
                 response = gemini_client.models.generate_content(
                     model=STT_MODEL,
                     contents=["Transcribe this audio clip.", uploaded]
                 )
-                
-                # Clean up uploaded file immediately (good practice)
                 gemini_client.files.delete(name=uploaded.name)
-                
-                return response.text
-                
+                try:
+                    return response.text
+                except Exception:
+                    logger.exception("Unexpected STT response structure for uploaded file: %s", repr(response)[:1000])
+                    return "Gemini STT returned an unexpected response format."
             except Exception as e_upload:
-                # If file upload not available in SDK or fails, return informative error
+                logger.exception("Gemini upload or STT error: %s", e_upload)
                 return f"Gemini file-upload/model error: {e_upload}. File size: {size_bytes} bytes"
 
     except APIError as gen_e:
+        logger.exception("Gemini STT APIError: %s", gen_e)
         return f"Gemini STT API error: {gen_e}"
     except Exception as general_e:
+        logger.exception("Unexpected Gemini STT error: %s", general_e)
         return f"Unexpected Gemini STT error: {general_e}"
 
 
+# get_bot_response largely kept, but ensure defensive handling by callers
+
 def get_bot_response(user_query: str) -> str:
-    clean_query = user_query.lower().strip()
-    # Simple regex to remove punctuation for robust persona matching
+    try:
+        clean_query = user_query.lower().strip()
+    except Exception:
+        clean_query = ""
+
     clean_query = re.sub(r'[^\w\s]', '', clean_query).strip()
 
-    # --- 1. Check for hardcoded persona responses ---
     for key, response in GEMINI_PERSONA_RESPONSES.items():
         cleaned_key = re.sub(r'[^\w\s]', '', key.lower())
         if cleaned_key in clean_query:
             return response
-            
-    # --- 2. General Chat via Gemini API ---
+
     if api_key_status == "active":
         try:
-            # Add user message to history before generating content
             history_to_send = format_chat_history(st.session_state.messages)
             system_prompt = "You are Gemini, a helpful, knowledgeable, and focused AI assistant. Keep your general chat responses concise and informative."
-            
-            # NOTE: gemini-2.5-flash is used for general chat, consistent with STT fix
+
             response = gemini_client.models.generate_content(
                 model='gemini-2.5-flash',
                 contents=history_to_send,
                 config=genai.types.GenerateContentConfig(
-                    # Safely specify the tool. Using a list of dicts for tool specification
-                    # is compatible across different SDK versions.
                     tools=[{"google_search": {}}]
                 )
             )
-            return response.text
-        
+            try:
+                return response.text
+            except Exception:
+                logger.exception("Unexpected general chat response structure: %s", repr(response)[:1000])
+                return "Sorry — the model returned an unexpected response format."
+
         except Exception as e:
-            # If API call fails, remove the last user message to avoid a corrupted history state
-            st.session_state.messages.pop()
+            logger.exception("Error calling Gemini for general chat: %s", e)
+            # avoid leaving session_state mutated incorrectly
+            try:
+                if st.session_state.messages:
+                    st.session_state.messages.pop()
+            except Exception:
+                pass
             return f"I apologize, I'm experiencing an API error ({type(e).__name__}) and cannot process that request right now."
     else:
         return "I can only answer the 5 specific persona questions right now because my Gemini API key is not configured."
 
 
-# --- 4. Streamlit UI and Interaction Flow ---
+# ------------------------- Streamlit UI and Interaction Flow -------------------------
 
 st.title("🗣️ Gemini Voice Persona Bot (WebRTC)")
 st.markdown("---")
 st.caption("Press 'Start' to turn on the mic, speak your question, and then press 'Stop'. Check network and firewall if connection issues persist.")
 
-# Initialize session state
 if "messages" not in st.session_state:
     st.session_state.messages = []
     st.session_state.messages.append(
         {"role": "assistant", "content": "Hello! I am ready to answer your questions. Press Start to enable your microphone."}
     )
 if 'last_prompt_voice' not in st.session_state:
-    # Tracks the last *successful* transcribed prompt to prevent re-processing on st.rerun()
     st.session_state['last_prompt_voice'] = ''
 
-# --- WebRTC Component ---
-ctx = webrtc_streamer(
+# Safe wrapper for webrtc_streamer to avoid unhandled exceptions
+def start_webrtc_streamer_safe(**kwargs):
+    try:
+        return webrtc_streamer(**kwargs)
+    except Exception as e:
+        logger.exception("webrtc_streamer failed to start: %s", e)
+        st.warning("Audio input temporarily unavailable. Please reload the page.")
+        return None
+
+ctx = start_webrtc_streamer_safe(
     key="mic-stt-stream",
     mode=WebRtcMode.SENDONLY,
     audio_processor_factory=MicAudioProcessor,
     media_stream_constraints=MediaStreamConstraints(video=False, audio=True),
     async_processing=True,
-    # Stability fix: STUN server configuration for better connectivity
     rtc_configuration={"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
 )
 
-# Safety Check: Get processor only if available
-processor = get_audio_processor(ctx) if ctx.audio_processor else None
+processor = get_audio_processor(ctx) if ctx else None
 
-# --- Custom Start/Stop Buttons and Logic ---
 st.markdown("---")
-
 col1, col2 = st.columns([1, 1])
 
-# Determine button states with processor check
-is_recording = processor and processor.is_recording
-start_disabled = not ctx.state.playing or is_recording
-stop_disabled = not ctx.state.playing or not is_recording
+is_recording = bool(processor and getattr(processor, 'is_recording', False))
+start_disabled = not (ctx and getattr(ctx, 'state', None) and getattr(ctx.state, 'playing', False)) or is_recording
+stop_disabled = not (ctx and getattr(ctx, 'state', None) and getattr(ctx.state, 'playing', False)) or not is_recording
 
 with col1:
     start_button = st.button("🔴 Start Recording", disabled=start_disabled)
@@ -256,81 +279,81 @@ with col1:
 with col2:
     stop_button = st.button("⏹️ Stop Recording", disabled=stop_disabled)
 
-if ctx.state.playing and processor:
+if ctx and getattr(ctx, 'state', None) and getattr(ctx.state, 'playing', False) and processor:
     if start_button:
-        # Clear previous recording and start new one
         processor.audio_chunks = []
         processor.is_recording = True
         st.info("🎙️ Recording started! Please speak now.")
-        st.rerun() 
+        st.experimental_rerun()
 
     if stop_button:
         processor.is_recording = False
         st.info("Processing audio... Please wait.")
-        
+
         if processor.audio_chunks:
             audio_bytes = b"".join(processor.audio_chunks)
-            
-            # --- Transcription Step ---
+            processor.audio_chunks = []
+
             prompt = transcribe_audio(audio_bytes)
-            
-            # Reset chunks immediately to prepare for the next recording
-            processor.audio_chunks = [] 
-            
-            # Check 1: Ignore empty or failure prompts
+
             if not prompt or prompt.isspace() or "error" in prompt.lower():
                 with st.chat_message("assistant"):
                     st.error(prompt if prompt else "Transcription returned empty text. Please try again.")
-            
-            # Check 2: Process a successful prompt
-            # Check against last_prompt_voice is a guardrail against re-running on browser refresh
+
             elif prompt != st.session_state.get('last_prompt_voice', ''):
                 st.session_state['last_prompt_voice'] = prompt
-                
-                # Display the user's transcribed prompt
                 st.session_state.messages.append({"role": "user", "content": prompt})
-                
-                # Get the bot's response
-                bot_response = get_bot_response(prompt)
+
+                # Safely get bot response
+                try:
+                    bot_response = get_bot_response(prompt)
+                except Exception as e:
+                    logger.exception("Unhandled error in get_bot_response: %s", e)
+                    bot_response = "Sorry — couldn't generate a response right now."
+
+                if not bot_response:
+                    logger.warning("get_bot_response returned empty; using fallback")
+                    bot_response = "Sorry — couldn't generate a response right now."
+
                 st.session_state.messages.append({"role": "assistant", "content": bot_response})
-                
-                # Speak the response
-                text_to_speech(bot_response)
-                
+
+                try:
+                    text_to_speech(bot_response)
+                except Exception:
+                    logger.exception("text_to_speech failed")
+
         else:
             st.warning("No audio was recorded.")
-        
-        st.rerun()
+
+        st.experimental_rerun()
 
 # --- Display Chat Messages ---
-
 st.markdown("---")
-# Iterate backwards to ensure the latest message is read aloud immediately after generation
-for message in st.session_state.messages:
+for idx, message in enumerate(st.session_state.messages):
     with st.chat_message(message["role"]):
-        st.markdown(message["content"])
-        
+        st.markdown(message["content"]) 
         if message["role"] == "assistant":
-            button_key_index = st.session_state.messages.index(message)
-            # Use lambda or functools.partial for dynamic arguments in on_click
-            # The args= must be a tuple
-            st.button("🔊 Read Aloud", key=f"tts_hist_{button_key_index}", 
-                      on_click=text_to_speech, args=(message["content"],))
-
+            st.button("🔊 Read Aloud", key=f"tts_hist_{idx}", on_click=text_to_speech, args=(message["content"],))
 
 st.markdown("---")
 st.caption("You may also use the text input below for debugging.")
 
-# --- Optional Text Input Fallback ---
 if prompt := st.chat_input("Type your question here..."):
-    
-    # Clear voice prompt state when using text input
     st.session_state['last_prompt_voice'] = ''
-    
-    # --- Text Input Processing ---
     st.session_state.messages.append({"role": "user", "content": prompt})
-    bot_response = get_bot_response(prompt)
+    try:
+        bot_response = get_bot_response(prompt)
+    except Exception as e:
+        logger.exception("Unhandled error in get_bot_response (text input): %s", e)
+        bot_response = "Sorry — couldn't generate a response right now."
+
+    if not bot_response:
+        bot_response = "Sorry — couldn't generate a response right now."
+
     st.session_state.messages.append({"role": "assistant", "content": bot_response})
-    text_to_speech(bot_response) 
-    
-    st.rerun()
+    try:
+        text_to_speech(bot_response)
+    except Exception:
+        logger.exception("text_to_speech failed (text input)")
+
+    st.experimental_rerun()
